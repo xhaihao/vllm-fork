@@ -153,7 +153,10 @@ class BaiChuanAttention(nn.Module):
             self.attn = Attention(self.num_heads,
                                   self.head_dim,
                                   scaling,
-                                  alibi_slopes=alibi_slopes)
+                                  alibi_slopes=alibi_slopes,
+                                  num_kv_heads=self.num_heads,
+                                  max_seq_len=self.max_position_embeddings)
+
         else:
             self.rotary_emb = get_rope(
                 self.head_dim,
