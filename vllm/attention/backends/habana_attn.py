@@ -145,7 +145,7 @@ class HabanaAttentionImpl(AttentionImpl):
         self.sliding_window = sliding_window
         self.position_bias = None
         if alibi_slopes is not None:
-            alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.bfloat16)
+            alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
             self.position_bias = _make_alibi_bias(alibi_slopes,
                                                   num_kv_heads,
                                                   alibi_slopes.dtype,
