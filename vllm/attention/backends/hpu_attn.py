@@ -114,7 +114,7 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
         self.alibi_slopes = alibi_slopes
         if alibi_slopes is not None:
             alibi_slopes_tensor = torch.tensor(alibi_slopes,
-                                               dtype=torch.bfloat16)
+                                               dtype=torch.float32)
             self.alibi_slopes = alibi_slopes_tensor
         self.max_seq_len = max_seq_len
         assert self.num_heads % self.num_kv_heads == 0
