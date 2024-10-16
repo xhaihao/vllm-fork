@@ -206,7 +206,7 @@ class HabanaAttentionImpl(AttentionImpl):
                 assert prefill_meta.attn_bias is not None, 'attn_bias must be set before calling model.forward!'
                 attn_bias = prefill_meta.attn_bias
                 if self.alibi_slopes is not None:
-                    attn_bias.add_(self.position_bias[:, :, -attn_bias.size(2):, -attn_bias.size(3):])
+                    attn_bias = attn_bias.add(self.position_bias[:, :, -attn_bias.size(2):, -attn_bias.size(3):])
 
                 query_shape = (batch_size, seq_len, self.num_heads, self.head_size)
                 kv_shape = (batch_size, seq_len_kv, self.num_kv_heads, self.head_size)
