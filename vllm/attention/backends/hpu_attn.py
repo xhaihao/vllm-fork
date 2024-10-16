@@ -202,7 +202,7 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                             attn_bias.dtype, attn_bias.shape[-1], False)
                         attn_bias = attn_bias.tile(
                             (1, self.num_kv_heads, 1, 1))
-                        attn_bias.add_(position_bias)
+                        attn_bias = attn_bias.add(position_bias)
                 else:
                     attn_bias = None
 
