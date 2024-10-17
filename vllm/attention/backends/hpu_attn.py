@@ -199,7 +199,7 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                     if self.alibi_slopes is not None:
                         position_bias = _make_alibi_bias(
                             self.alibi_slopes, self.num_kv_heads,
-                            attn_bias.dtype, attn_bias.shape[-1])
+                            attn_bias.dtype, attn_bias.shape[-1], False)
                         attn_bias = attn_bias.tile(
                             (1, self.num_kv_heads, 1, 1))
                         attn_bias.add_(position_bias)
@@ -242,7 +242,8 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                 self.position_bias = _make_alibi_bias(self.alibi_slopes,
                                                     self.num_kv_heads,
                                                     attn_bias.dtype,
-                                                    self.max_seq_len if self.max_seq_len is not None else attn_bias.shape[-1])
+                                                    self.max_seq_len if self.max_seq_len is not None else attn_bias.shape[-1],
+                                                    True)
 
             output = HPUPagedAttention.forward_decode(
                 query=query,
@@ -263,13 +264,22 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
         # Reshape the output tensor.
         return output.view(batch_size, seq_len, hidden_size)
 
+shared_bias = None
+shared_bias_nkh = 0
+shared_bias_dtype = torch.float32
+shared_bias_seq_len = 0
 
 def _make_alibi_bias(
     alibi_slopes: torch.Tensor,
     num_kv_heads: int,
     dtype: torch.dtype,
     seq_len: int,
+    saved:  bool,
 ) -> torch.Tensor:
+    global shared_bias, shared_bias_nkh, shared_bias_dtype, shared_bias_seq_len
+    if shared_bias is not None and shared_bias_nkh == num_kv_heads and shared_bias_dtype == dtype and shared_bias_seq_len == seq_len and saved:
+        return shared_bias
+
     bias = torch.arange(seq_len, dtype=dtype)
     # NOTE(zhuohan): HF uses
     #     `bias = bias[None, :].repeat(seq_len, 1)`
@@ -293,4 +303,11 @@ def _make_alibi_bias(
     bias.mul_(alibi_slopes[:, None, None])
     if num_heads != num_kv_heads:
         bias = bias.unflatten(1, (num_kv_heads, num_heads // num_kv_heads))
+
+    if saved:
+        shared_bias = bias
+        shared_bias_nkh =num_kv_heads
+        shared_bias_dtype = dtype
+        shared_bias_seq_len = seq_len
+
     return bias
