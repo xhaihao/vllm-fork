@@ -252,12 +252,21 @@ class HabanaAttentionImpl(AttentionImpl):
         return output.view(batch_size, seq_len, hidden_size)
 
 
+shared_bias = None
+shared_bias_nkh = 0
+shared_bias_dtype = torch.float32
+shared_bias_seq_len = 0
+
 def _make_alibi_bias(
     alibi_slopes: torch.Tensor,
     num_kv_heads: int,
     dtype: torch.dtype,
     seq_len: int,
 ) -> torch.Tensor:
+    global shared_bias, shared_bias_nkh, shared_bias_dtype, shared_bias_seq_len
+    if shared_bias is not None and shared_bias_nkh == num_kv_heads and shared_bias_dtype == dtype and shared_bias_seq_len == seq_len:
+        return shared_bias
+
     bias = torch.arange(seq_len, dtype=dtype)
     # NOTE(zhuohan): HF uses
     #     `bias = bias[None, :].repeat(seq_len, 1)`
@@ -281,4 +290,10 @@ def _make_alibi_bias(
     bias.mul_(alibi_slopes[:, None, None])
     if num_heads != num_kv_heads:
         bias = bias.unflatten(1, (num_kv_heads, num_heads // num_kv_heads))
-    return bias
+
+    shared_bias = bias
+    shared_bias_nkh =num_kv_heads
+    shared_bias_dtype = dtype
+    shared_bias_seq_len = seq_len
+
+    return shared_bias
