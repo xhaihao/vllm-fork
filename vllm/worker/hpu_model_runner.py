@@ -1183,6 +1183,10 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                                     dtype=self.model_config.dtype,
                                     device=self.device)
 
+        seq_lens_tensor = torch.tensor(seq_lens,
+                                       dtype=torch.int,
+                                       device=self.device)
+
         attn_metadata = self.attn_backend.make_metadata(
             is_prompt=False,
             block_list=block_list,
@@ -1193,7 +1197,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             block_scales=block_scales,
             block_groups=block_groups,
             attn_bias=None,
-            seq_lens_tensor=None,
+            seq_lens_tensor=seq_lens_tensor,
             context_lens_tensor=None,
             num_prefills=0,
             num_prefill_tokens=0,
@@ -1402,10 +1406,18 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         # input_hash(123) != input_hash(321)
         # input_hash("abc") != input_hash("cba")
         attention_metadata = subtuple(metadata, 'TrimmedAttentionMetadata', [
-            'attn_bias', 'seq_lens_tensor', 'context_lens_tensor',
-            'block_list', 'block_mapping', 'block_usage', 'slot_mapping',
-            'is_prompt', 'block_indices', 'block_offsets', 'block_scales',
-            'block_groups'
+            'attn_bias',
+            'seq_lens_tensor',
+            'context_lens_tensor',
+            'block_list',
+            'block_mapping',
+            'block_usage',
+            'slot_mapping',
+            'is_prompt',
+            'block_indices',
+            'block_offsets',
+            'block_scales',
+            'block_groups',
         ])
         return attention_metadata
 
