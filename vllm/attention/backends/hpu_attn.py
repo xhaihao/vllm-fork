@@ -118,6 +118,7 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
             alibi_slopes_tensor = torch.tensor(alibi_slopes,
                                                dtype=torch.bfloat16)
             self.alibi_slopes = alibi_slopes_tensor
+        self.max_seq_len = max_seq_len
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
@@ -235,6 +236,14 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
             output = out.reshape(batch_size, seq_len, hidden_size)
         else:
             # Decoding run.
+            self.position_bias = None
+            attn_bias = attn_metadata.attn_bias
+            if self.alibi_slopes is not None:
+                self.position_bias = _make_alibi_bias(self.alibi_slopes,
+                                                    self.num_kv_heads,
+                                                    attn_bias.dtype,
+                                                    self.max_seq_len if self.max_seq_len is not None else attn_bias.shape[-1])
+
             output = HPUPagedAttention.forward_decode(
                 query=query,
                 key_cache=key_cache,
@@ -245,10 +254,12 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                 block_scales=attn_metadata.block_scales,
                 block_groups=attn_metadata.block_groups,
                 scale=self.scale,
+                alibi_slopes=self.position_bias,
                 matmul_qk_op=self.matmul_qk,
                 matmul_av_op=self.matmul_av,
                 keys_fetch_func=self.k_cache.fetch_from_cache,
-                values_fetch_func=self.v_cache.fetch_from_cache)
+                values_fetch_func=self.v_cache.fetch_from_cache,
+            )
         # Reshape the output tensor.
         return output.view(batch_size, seq_len, hidden_size)
 
