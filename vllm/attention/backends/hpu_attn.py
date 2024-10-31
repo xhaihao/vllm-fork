@@ -99,7 +99,7 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
         sliding_window: Optional[int],
         kv_cache_dtype: str,
         blocksparse_params: Optional[Dict[str, Any]] = None,
-        max_seq_len: int = 4096,
+        max_seq_len: Optional[int] = 4096,
     ) -> None:
         super(AttentionImpl, self).__init__()
         self.kv_cache_dtype = kv_cache_dtype
@@ -118,7 +118,12 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
             alibi_slopes_tensor = torch.tensor(alibi_slopes,
                                                dtype=torch.float32)
             self.alibi_slopes = alibi_slopes_tensor
-        self.max_seq_len = max_seq_len
+
+        if max_seq_len is not None:
+            self.max_seq_len = max_seq_len
+        else:
+            self.max_seq_len = 4096
+
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
