@@ -99,7 +99,8 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
         sliding_window: Optional[int],
         kv_cache_dtype: str,
         blocksparse_params: Optional[Dict[str, Any]] = None,
-        max_seq_len: int = 4096,
+        logits_soft_cap: Optional[float] = None,
+        max_seq_len: Optional[int] = 4096,
     ) -> None:
         super(AttentionImpl, self).__init__()
         self.kv_cache_dtype = kv_cache_dtype
