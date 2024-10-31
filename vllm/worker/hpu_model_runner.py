@@ -318,7 +318,7 @@ class HpuModelAdapter():
         mask = mask >= metadata.block_usage.unsqueeze(-1)
         attn_bias = (torch.zeros_like(mask, dtype=dtype).masked_fill_(
             mask, -math.inf))
-        if is_fake_hpu():
+        if True:
             # Unfortunately one_hot on CPU doesn't handle
             # out of bounds classes. We need to mask those
             # values manually
