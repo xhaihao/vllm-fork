@@ -34,7 +34,7 @@ class Attention(nn.Module):
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         blocksparse_params: Optional[Dict[str, Any]] = None,
-        logits_soft_cap: Optional[float] = None,
+        logits_soft_cap: Optional[int] = 4096,
         prefix: str = "",
     ) -> None:
         super().__init__()

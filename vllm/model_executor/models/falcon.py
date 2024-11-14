@@ -158,7 +158,9 @@ class FalconAttention(nn.Module):
                                   self.head_dim,
                                   self.inv_norm_factor,
                                   num_kv_heads=self.num_kv_heads,
-                                  quant_config=quant_config)
+                                  quant_config=quant_config,
+                                  logits_soft_cap=max_position_embeddings,
+                                )
         elif self.use_alibi:
             tp_rank = get_tensor_model_parallel_rank()
             head_start = tp_rank * self.num_heads
@@ -346,7 +348,6 @@ class FalconModel(nn.Module):
         self.config = config
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
-        self.use_alibi = config.alibi
 
         # Embedding + LN Embedding
         self.word_embeddings = VocabParallelEmbedding(
@@ -417,6 +418,7 @@ class FalconForCausalLM(nn.Module, SupportsPP):
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
+        self.use_alibi = config.alibi
         self.transformer = FalconModel(vllm_config=vllm_config,
                                        prefix=maybe_prefix(
                                            prefix, "transformer"))

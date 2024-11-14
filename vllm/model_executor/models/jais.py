@@ -114,7 +114,9 @@ class JAISAttention(nn.Module):
                               scale=self.scale,
                               alibi_slopes=alibi_slopes,
                               cache_config=cache_config,
-                              quant_config=quant_config)
+                              quant_config=quant_config,
+                              logits_soft_cap=config.max_position_embeddings,
+                            )
 
     def forward(
         self,
@@ -297,6 +299,7 @@ class JAISLMHeadModel(nn.Module, SupportsPP):
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
+        self.use_alibi = config.position_embedding_type == "alibi"
         self.transformer = JAISModel(vllm_config=vllm_config,
                                      prefix=maybe_prefix(
                                          prefix, "transformer"))

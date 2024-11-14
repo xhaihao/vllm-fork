@@ -215,7 +215,7 @@ class HpuModelAdapter:
         mask = causal_mask.logical_or(len_mask)
         mask = torch.concat((past_mask, mask), dim=-1)
         attn_bias = (torch.zeros_like(mask, dtype=dtype).masked_fill_(
-            mask, -math.inf))
+            mask, torch.finfo(dtype).min))
         attn_metadata = prefill_metadata._replace(attn_bias=attn_bias)
         return attn_metadata
 
@@ -226,7 +226,7 @@ class HpuModelAdapter:
                             dtype=torch.int32).unsqueeze(0)
         mask = mask >= metadata.block_usage.unsqueeze(-1)
         attn_bias = (torch.zeros_like(mask, dtype=dtype).masked_fill_(
-            mask, -math.inf))
+            mask, torch.finfo(dtype).min))
 
         if not is_fake_hpu() and htorch.utils.internal.is_lazy():
             block_mapping = torch.nn.functional.one_hot(metadata.block_groups,
@@ -635,6 +635,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                 self.model = self.model.to("hpu")
                 htcore.mark_step()
 
+            self.use_alibi = hasattr(self.model, "use_alibi") and self.model.use_alibi
             hidden_layer_markstep_interval = int(
                 os.getenv('VLLM_CONFIG_HIDDEN_LAYERS', '1'))
             modify_decoder_layer(
@@ -865,19 +866,20 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             block_list=prefix_block_list_tensor,
             block_mapping=None,
             block_usage=None,
-            block_indices=None,
-            block_offsets=None,
-            block_scales=None,
+            block_indices=None,    # Set by later "precompute_indices_and_offsets" function call
+            block_offsets=None,    # Set by later "precompute_indices_and_offsets" function call
+            block_scales=None,     # Set by later "_set_block_scales" function call
             block_groups=None,
-            attn_bias=None,
+            attn_bias=None,        # Set by later "_set_attn_bias" function call
             seq_lens_tensor=seq_lens_tensor,
             context_lens_tensor=context_lens_tensor,
             num_prefills=real_num_seqs,
             num_prefill_tokens=sum_query_len,
             num_decode_tokens=0,
             slot_mapping=slot_mapping,
-            multi_modal_placeholder_index_maps=
-            None  # FIXME(kzawora): mutli-modality will not work here
+            alibi_blocks=None,
+            # FIXME(kzawora): mutli-modality will not work here
+            multi_modal_placeholder_index_maps=None,
         )
         multi_modal_kwargs = MultiModalKwargs.batch(multi_modal_kwargs_list)
 
@@ -976,23 +978,27 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
 
         num_decode_tokens = sum(seq_lens)
 
-        last_block_usage = [
-            slot[0] % self.block_size + 1 for slot in slot_mapping
-        ]
-        block_groups = [[i] * len(bt) for i, bt in enumerate(block_tables)]
-        block_usage = [[self.block_size] * (len(bt) - 1) + [lbu]
-                       for bt, lbu in zip(block_tables, last_block_usage)
-                       if bt]
-
-        block_list = flatten(block_tables)
-        block_groups = flatten(block_groups)
-        block_usage = flatten(block_usage)
-
-        assert len(block_list) == len(block_groups)
-        assert len(block_list) == len(block_usage)
-
+        block_list = []
+        block_groups = []
+        block_usage = []
         padding_fn = None
         if self.use_contiguous_pa:
+            last_block_usage = [
+                slot[0] % self.block_size + 1 for slot in slot_mapping
+            ]
+
+            block_groups = [[i] * len(bt) for i, bt in enumerate(block_tables)]
+            block_usage = [[self.block_size] * (len(bt) - 1) + [lbu]
+                        for bt, lbu in zip(block_tables, last_block_usage)
+                        if bt]
+
+            block_list = flatten(block_tables)
+            block_groups = flatten(block_groups)
+            block_usage = flatten(block_usage)
+
+            assert len(block_list) == len(block_groups)
+            assert len(block_list) == len(block_usage)
+
             block_bucket_size = max(max(block_list) + 1, len(block_list))
             block_bucket_size = self.bucketing_ctx.get_padded_decode_num_blocks(
                 block_bucket_size)
@@ -1003,6 +1009,21 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             padding_fn = lambda tensor, pad_value: gather_list(
                 tensor, indices, pad_value)
         else:
+            for i, bt in enumerate(block_tables):
+                blocks_in_group = len(bt)
+                for j, idx in enumerate(bt):
+                    if len(block_list) < idx:
+                        slots_to_add = (idx - len(block_list))
+                        block_list += [_PAD_BLOCK_ID] * slots_to_add
+                        block_groups += [-1] * slots_to_add
+                        block_usage += [0] * slots_to_add
+                    block_list[idx - 1] = idx
+                    block_groups[idx - 1] = i
+                    if seq_lens[i] - self.block_size * j > self.block_size:
+                        block_usage[idx - 1] = self.block_size
+                    else:
+                        block_usage[idx - 1] = seq_lens[i] - self.block_size * j
+
             block_bucket_size = self.bucketing_ctx.get_padded_decode_num_blocks(
                 len(block_list))
             padding_fn = lambda tensor, pad_value: pad_list(
@@ -1010,9 +1031,47 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
 
         block_list = padding_fn(block_list, _PAD_BLOCK_ID)
         block_groups = padding_fn(block_groups, -1)
-        block_usage = padding_fn(block_usage, 1)
+        block_usage = padding_fn(block_usage, 0)
 
-        block_list = torch.tensor(block_list, dtype=torch.int, device='cpu')
+        alibi_blocks = None
+        if self.use_alibi:
+            alibi_blocks = self._compute_alibi_block(block_tables, seq_lens, len(block_groups))
+            alibi_blocks = alibi_blocks.to(  # type: ignore
+                self.device, non_blocking=True)
+
+        # NOTE(Tanner):
+        # Below I will explain why these changes are needed. This comment should be removed before this PR merges.
+        # Note that these issues all require "BATCH_SIZE" greater than 1 to occur.
+        # With the current code on "habana_main" I get the following structures when a sequence out of a batch terminates early.
+        #
+        #  seq_lens     -> [200, 198, 198, 1]
+        #  block_tables -> [[2, 5], [3, 7], [4, 8], []]
+        #  block_list   -> [2, 5, 3, 7, 4, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        #  block_groups -> [0, 0, 1, 1, 2, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
+        #  block_usage  -> [128, 72, 128, 70, 128, 70, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        #
+        # Note how "block_tables" specified blocks 2 to 8 as used with block 1 unused.
+        # However, the "block_list" populates continuously not leaving block=1 (index=0) as unused.
+        # Similar issues occur for "block_groups" and "block_usage". Actually, block groups has an additional
+        # issue where the assignments assume each sequence gets blocks continuously. This not only causes issues when
+        # a sequence ends early but can even be incorrect when a new block is acquired.
+        #
+        # After my code changes we now get the below structures.
+        #
+        #   seq_lens     -> [110, 112, 110, 1]
+        #   block_tables -> [[1], [2], [4], []]
+        #   block_list   -> [1, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        #   block_groups -> [0, 1, -1, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
+        #   block_usage  -> [110, 112, 0, 110, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        #
+        # It can be clearly seen that the block_list, block_groups, and block_usage assignments now follow block_tables contents.
+        #
+        # One additional fix is block_usage is now not padding with "1". Padding with "1" caused issues for ALiBI biases where "attn_bias" structure
+        # which gets created later was not masking out future values properly.
+        #
+        block_list = torch.tensor(block_list,
+                                  dtype=torch.int,
+                                  device='cpu')
         block_groups = torch.tensor(block_groups,
                                     dtype=torch.int,
                                     device='cpu')
@@ -1039,20 +1098,22 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         attn_metadata = self.attn_backend.make_metadata(
             is_prompt=False,
             block_list=block_list,
-            block_mapping=None,
+            block_mapping=None,    # Set by later "_set_block_mapping" function call
             block_usage=block_usage,
-            block_indices=None,
-            block_offsets=None,
-            block_scales=None,
+            block_indices=None,    # Set by later "precompute_indices_and_offsets" function call
+            block_offsets=None,    # Set by later "precompute_indices_and_offsets" function call
+            block_scales=None,     # Set by later "_set_block_scales" function call
             block_groups=block_groups,
-            attn_bias=None,
+            attn_bias=None,        # Set by later "_set_block_mapping" function call
             seq_lens_tensor=None,
             context_lens_tensor=None,
             num_prefills=0,
             num_prefill_tokens=0,
             num_decode_tokens=num_decode_tokens,
             slot_mapping=slot_mapping,
-            multi_modal_placeholder_index_maps=None)
+            alibi_blocks=alibi_blocks,
+            multi_modal_placeholder_index_maps=None,
+        )
         return PrepareDecodeMetadata(input_tokens=input_tokens,
                                      input_positions=input_positions,
                                      attn_metadata=attn_metadata,
@@ -1061,6 +1122,30 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                                      lora_requests=lora_requests,
                                      slot_mapping=slot_mapping,
                                      lora_ids=lora_ids)
+
+    def _compute_alibi_block(self, block_tables, seq_lens, num_blocks):
+        # Create intermediary and output strctures
+        max_block_table_len = max(len(block_table) for block_table in block_tables)
+        alibi_offsets = torch.arange(-max_block_table_len * self.block_size + 1, 1, dtype=torch.long, device='cpu')
+        alibi_blocks = torch.zeros((num_blocks, self.block_size), dtype=torch.long, device='cpu')
+
+        # Assign biases per token
+        for batch_idx in range(len(block_tables)):
+            seq_len = seq_lens[batch_idx]
+            for seq_idx in range(len(block_tables[batch_idx])):
+                block_idx = block_tables[batch_idx][seq_idx] - 1
+
+                # Calculate the number of valid positions in the current block
+                valid_length = seq_len - seq_idx * self.block_size
+                if valid_length > 0:
+                    current_block_length = min(valid_length, self.block_size)
+                    offset_end = current_block_length - valid_length
+                    if offset_end == 0:
+                        alibi_blocks[block_idx][:current_block_length] = alibi_offsets[-valid_length:]
+                    else:
+                        alibi_blocks[block_idx][:current_block_length] = alibi_offsets[-valid_length:offset_end]
+
+        return alibi_blocks
 
     def prepare_input_tensors(
         self,
@@ -1254,10 +1339,19 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         # input_hash(123) != input_hash(321)
         # input_hash("abc") != input_hash("cba")
         attention_metadata = subtuple(metadata, 'TrimmedAttentionMetadata', [
-            'attn_bias', 'seq_lens_tensor', 'context_lens_tensor',
-            'block_list', 'block_mapping', 'block_usage', 'slot_mapping',
-            'is_prompt', 'block_indices', 'block_offsets', 'block_scales',
-            'block_groups'
+            'attn_bias',
+            'seq_lens_tensor',
+            'context_lens_tensor',
+            'block_list',
+            'block_mapping',
+            'block_usage',
+            'slot_mapping',
+            'is_prompt',
+            'block_indices',
+            'block_offsets',
+            'block_scales',
+            'block_groups',
+            'alibi_blocks',
         ])
         return attention_metadata
 
@@ -1270,6 +1364,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         sampling_params = SamplingParams(temperature=temperature)
         num_blocks = math.ceil(seq_len / self.block_size)
         seq_len = max(seq_len, 1)
+        last_block_assigned = group_id * num_blocks
         if is_prompt:
             input_len = seq_len
             output_len = 0
@@ -1277,7 +1372,13 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         else:
             input_len = seq_len - 1
             output_len = 1
-            block_tables = {group_id: [_PAD_BLOCK_ID] * num_blocks}
+            # NOTE(Tanner):
+            # ALiBI biases fail if block_tables for dummy sequences are all zeros.
+            # By default "_PAD_BLOCK_ID" is "0" and this is not a realistic value for block tables.
+            block_tables = {group_id: []}
+            for block_idx in range(num_blocks):
+                last_block_assigned += 1
+                block_tables[group_id] += [last_block_assigned]
         prompt_token_ids = [0] * input_len
         output_token_ids = [1] * output_len
         prompt_token_ids_array = array('l', prompt_token_ids)  # noqa: F821
@@ -1351,13 +1452,15 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                     temperature=temperature) for i in range(batch_size)
             ]
         else:
-            # FIXME: seq_len is actually number of blocks
-            blocks = [seq_len // batch_size for _ in range(batch_size)]
-            blocks[0] += seq_len % batch_size
+            # NOTE(Tanner):
+            # seq_len should be a multiple of block size
+            # This change logically makes sense to me. But code crashes without it which doesnt make sense.
+            # Minimum of 1 block per sequence.
+            blocks = [max([1, seq_len // self.block_size]) for _ in range(batch_size)]
             seqs = [
                 self.create_dummy_seq_group_metadata(
                     i,
-                    b * self.block_size - 1,
+                    b * self.block_size,
                     is_prompt,
                     lora_request=dummy_lora_requests_per_seq[i]
                     if dummy_lora_requests_per_seq else None,
@@ -1823,7 +1926,7 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
         This is a helper function to create the mask for lora computations.
         Lora Mask is needed to ensure we match the correct lora weights for the
         for the request.
-        For Prompt phase we have 
+        For Prompt phase we have
         lora_mask with shape (batch_size * seq_len, max_loras * max_rank)
         lora_logits_mask with shape (batch_size, max_loras * max_rank)
         For Decode phase we have both

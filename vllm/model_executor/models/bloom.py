@@ -293,6 +293,7 @@ class BloomForCausalLM(nn.Module, SupportsPP):
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
+        self.use_alibi = True
         self.transformer = BloomModel(vllm_config=vllm_config,
                                       prefix=maybe_prefix(
                                           prefix, "transformer"))

@@ -58,6 +58,7 @@ class MPTAttention(nn.Module):
         self.clip_qkv = config.attn_config["clip_qkv"]
         self.qk_ln = config.attn_config["qk_ln"]
         self.alibi_bias_max = config.attn_config["alibi_bias_max"]
+        self.max_seq_len = config.max_seq_len
         if "kv_n_heads" in config.attn_config:
             self.total_num_kv_heads = config.attn_config['kv_n_heads']
         else:
@@ -115,7 +116,9 @@ class MPTAttention(nn.Module):
                               alibi_slopes=alibi_slopes,
                               num_kv_heads=self.num_kv_heads,
                               cache_config=cache_config,
-                              quant_config=quant_config)
+                              quant_config=quant_config,
+                              logits_soft_cap=self.max_seq_len,
+                            )
 
     def forward(
         self,
@@ -281,7 +284,7 @@ class MPTForCausalLM(nn.Module, SupportsPP):
         self.config = config
         assert config.tie_word_embeddings
         self.quant_config = quant_config
-
+        self.use_alibi = config.attn_config['alibi']
         self.transformer = MPTModel(vllm_config=vllm_config,
                                     prefix=maybe_prefix(prefix, "transformer"))
         self.lm_head = self.transformer.wte
