@@ -414,7 +414,7 @@ def merge_multimodal_embeddings(
 
 class LayerFn(Protocol):
 
-    def __call__(self, prefix: str) -> torch.nn.Module:
+    def __call__(self, prefix: str, prev_layer: Any) -> torch.nn.Module:
         ...
 
 
@@ -506,11 +506,22 @@ def make_layers(
     start_layer, end_layer = get_pp_indices(num_hidden_layers,
                                             get_pp_group().rank_in_group,
                                             get_pp_group().world_size)
-    modules = torch.nn.ModuleList(
-        [PPMissingLayer() for _ in range(start_layer)] + [
-            maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}"))
-            for idx in range(start_layer, end_layer)
-        ] + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)])
+    layers = []
+    for _ in range(start_layer):
+        curr_layer = PPMissingLayer()
+        layers.append(curr_layer)
+
+    curr_layer = None
+    for idx in range(start_layer, end_layer):
+        curr_layer = layer_fn(prefix=f"{prefix}.{idx}", prev_layer=curr_layer)
+        layers.append(maybe_offload_to_cpu(curr_layer))
+
+    for _ in range(end_layer, num_hidden_layers):
+        curr_layer = PPMissingLayer()
+        layers.append(curr_layer)
+
+    modules = nn.ModuleList(layers)
+
     return start_layer, end_layer, modules
 
 

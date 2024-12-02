@@ -1,6 +1,6 @@
 # Adapted from https://huggingface.co/mosaicml/mpt-7b/tree/main
 import math
-from typing import Iterable, List, Optional, Set, Tuple, Union
+from typing import Any, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -50,6 +50,7 @@ class MPTAttention(nn.Module):
         config: MPTConfig,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        prev_attn: Optional[Any] = None,
     ):
         super().__init__()
         self.d_model = config.d_model
@@ -118,6 +119,8 @@ class MPTAttention(nn.Module):
                               cache_config=cache_config,
                               quant_config=quant_config,
                               logits_soft_cap=self.max_seq_len,
+                              tp_rank=tp_rank,
+                              prev_attn=None if prev_attn is None else prev_attn.attn,
                             )
 
     def forward(
@@ -179,11 +182,12 @@ class MPTBlock(nn.Module):
         config: MPTConfig,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        prev_layer: Optional[Any] = None
     ):
         super().__init__()
         hidden_size = config.d_model
         self.norm_1 = nn.LayerNorm(hidden_size)
-        self.attn = MPTAttention(config, cache_config, quant_config)
+        self.attn = MPTAttention(config, cache_config, quant_config, prev_attn=None if prev_layer is None else prev_layer.attn)
         self.norm_2 = nn.LayerNorm(hidden_size)
         self.ffn = MPTMLP(config, quant_config)
 
@@ -227,7 +231,7 @@ class MPTModel(nn.Module):
         )
         self.start_layer, self.end_layer, self.blocks = make_layers(
             config.n_layers,
-            lambda prefix: MPTBlock(config, cache_config, quant_config),
+            lambda prefix, prev_layer: MPTBlock(config, cache_config, quant_config, prev_layer),
             prefix=f"{prefix}.blocks")
         self.norm_f = nn.LayerNorm(config.d_model)
         if config.no_bias:

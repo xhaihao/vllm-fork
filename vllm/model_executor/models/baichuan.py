@@ -18,7 +18,7 @@
 # limitations under the License.
 """Inference-only BaiChuan model compatible with HuggingFace weights."""
 import math
-from typing import Iterable, List, Optional, Set, Tuple, Union
+from typing import Any, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 from torch import nn
@@ -116,6 +116,7 @@ class BaiChuanAttention(nn.Module):
         max_position_embeddings: int = 8192,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        prev_attn: Optional[Any] = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -160,6 +161,8 @@ class BaiChuanAttention(nn.Module):
                                   alibi_slopes=alibi_slopes,
                                   quant_config=quant_config,
                                   logits_soft_cap=self.max_position_embeddings,
+                                  tp_rank=tp_rank,
+                                  prev_attn=None if prev_attn is None else prev_attn.attn,
                                 )
         else:
             self.rotary_emb = get_rope(
@@ -197,7 +200,8 @@ class BaiChuanDecoderLayer(nn.Module):
                  config: PretrainedConfig,
                  position_embedding: str,
                  cache_config: Optional[CacheConfig] = None,
-                 quant_config: Optional[QuantizationConfig] = None):
+                 quant_config: Optional[QuantizationConfig] = None,
+                 prev_layer: Optional[Any] = None):
         super().__init__()
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 10000)
@@ -211,6 +215,7 @@ class BaiChuanDecoderLayer(nn.Module):
             max_position_embeddings=max_position_embeddings,
             cache_config=cache_config,
             quant_config=quant_config,
+            prev_attn=None if prev_layer is None else prev_layer.self_attn,
         )
         self.mlp = BaiChuanMLP(
             hidden_size=self.hidden_size,
@@ -277,8 +282,8 @@ class BaiChuanModel(nn.Module):
         )
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: BaiChuanDecoderLayer(config, position_embedding,
-                                                cache_config, quant_config),
+            lambda prefix, prev_layer: BaiChuanDecoderLayer(config, position_embedding,
+                                                cache_config, quant_config, prev_layer),
             prefix=f"{prefix}.layers",
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

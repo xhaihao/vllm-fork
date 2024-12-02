@@ -104,6 +104,8 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
         kv_cache_dtype: str,
         blocksparse_params: Optional[Dict[str, Any]] = None,
         max_seq_len: int = 4096,
+        tp_rank: Optional[int] = None,
+        prev_attn: Optional[Any] = None,
     ) -> None:
         super(AttentionImpl, self).__init__()
         self.kv_cache_dtype = kv_cache_dtype
@@ -122,22 +124,26 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
         self.alibi_slopes = None
         self.prompt_position_bias = None
         self.max_seq_len = max_seq_len
+        self.tp_rank = tp_rank
+        self.prev_attn = None if prev_attn is None else prev_attn.impl
         if alibi_slopes is not None:
-            self.max_seq_len = int(os.getenv('VLLM_PROMPT_ALIBI_MAX_SEQ_LEN',
-                                              self.max_seq_len))
-            slope_tensor_dtype = {
-                True: torch.float32,
-                False: torch.bfloat16,
-            }[os.getenv('VLLM_ALIBI_USE_FLOAT32_BIASES', '0').lower() in ['1', 'true']]
-            alibi_slopes_tensor = torch.tensor(alibi_slopes,
-                                               dtype=slope_tensor_dtype)
-            self.alibi_slopes = alibi_slopes_tensor
-            self.prompt_position_bias = _make_prompt_alibi_bias(
-                self.alibi_slopes,
-                self.num_kv_heads,
-                self.alibi_slopes.dtype,
-                self.max_seq_len,
-            )
+            if self.prev_attn is not None and self.prev_attn.tp_rank == self.tp_rank:
+                self.alibi_slopes = self.prev_attn.alibi_slopes
+                self.prompt_position_bias = self.prev_attn.prompt_position_bias
+            else:
+                slope_tensor_dtype = {
+                    True: torch.float32,
+                    False: torch.bfloat16,
+                }[os.getenv('VLLM_ALIBI_USE_FLOAT32_BIASES', '1').lower() in ['1', 'true']]
+                alibi_slopes_tensor = torch.tensor(alibi_slopes,
+                                                   dtype=slope_tensor_dtype)
+                self.alibi_slopes = alibi_slopes_tensor
+                self.prompt_position_bias = _make_prompt_alibi_bias(
+                    self.alibi_slopes,
+                    self.num_kv_heads,
+                    self.alibi_slopes.dtype,
+                    self.max_seq_len,
+                )
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
@@ -264,16 +270,19 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
             output = out.reshape(batch_size, seq_len, hidden_size)
         else:
             # Decoding run.
-            position_bias = None
+            self.position_bias = None
             attn_bias = attn_metadata.attn_bias
             alibi_blocks = attn_metadata.alibi_blocks
             if self.alibi_slopes is not None and alibi_blocks is not None:
-                position_bias = _make_decode_alibi_bias(
-                    alibi_blocks,
-                    self.alibi_slopes,
-                    self.num_kv_heads,
-                    self.alibi_slopes.dtype,
-                )
+                if self.prev_attn is not None and self.prev_attn.tp_rank == self.tp_rank:
+                    self.position_bias = self.prev_attn.position_bias
+                else:
+                    self.position_bias = _make_decode_alibi_bias(
+                        alibi_blocks,
+                        self.alibi_slopes,
+                        self.num_kv_heads,
+                        self.alibi_slopes.dtype,
+                    )
 
             output = HPUPagedAttention.forward_decode(
                 query=query,
@@ -285,7 +294,7 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                 block_scales=attn_metadata.block_scales,
                 block_groups=attn_metadata.block_groups,
                 scale=self.scale,
-                position_bias=position_bias,
+                position_bias=self.position_bias,
                 matmul_qk_op=self.matmul_qk,
                 matmul_av_op=self.matmul_av,
                 batch2block_matmul_op=self.batch2block_matmul,
