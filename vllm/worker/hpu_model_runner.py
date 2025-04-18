@@ -2052,35 +2052,21 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                                         seq_len,
                                         is_prompt,
                                         lora_request=None,
-                                        temperature=0,
-                                        last_block_assigned=0):
+                                        temperature=0):
         if self.is_pooler:
             sampling_params = None
         else:
             sampling_params = SamplingParams(temperature=temperature)
+            num_blocks = math.ceil(seq_len / self.block_size)
         seq_len = max(seq_len, 1)
-        num_blocks = math.ceil(seq_len / self.block_size)
-        # FIXME(Tanner):
-        # When num_scheduler_steps>1 an additional
-        # token gets appended to dummy groups at some point
-        # This causes an RTE during warmup. Hence, subtracting 1 from seq_len.
-        seq_len = max(seq_len - 1, 1)
-        block_tables: Optional[dict[Any, Any]] = None
         if is_prompt:
             input_len = seq_len
             output_len = 0
+            block_tables = None
         else:
             input_len = seq_len - 1
             output_len = 1
-            # NOTE(Tanner):
-            # ALiBI biases fail if block_tables for
-            # dummy sequences are all zeros.
-            # By default "_PAD_BLOCK_ID" is "0" and this
-            # is not a realistic value for block tables.
-            block_tables = {group_id: []}
-            for block_idx in range(num_blocks):
-                last_block_assigned += 1
-                block_tables[group_id] += [last_block_assigned]
+            block_tables = {group_id: [_PAD_BLOCK_ID] * num_blocks}
         prompt_token_ids = [0] * input_len
         output_token_ids = [1] * output_len
         prompt_token_ids_array = array('l', prompt_token_ids)  # noqa: F821
@@ -2157,31 +2143,18 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                     temperature=temperature) for i in range(batch_size)
             ]
         else:
-            # NOTE(Tanner):
-            # seq_len is num blocks
-            # Here we assign as many blocks to each sequence as we can
-            blocks_per_seq = (seq_len - 1) // batch_size
-            extra_blocks = (seq_len - 1) % batch_size
-            blocks = [
-                blocks_per_seq + (1 if i < extra_blocks else 0)
-                for i in range(batch_size)
+            # FIXME: seq_len is actually number of blocks
+            blocks = [seq_len // batch_size for _ in range(batch_size)]
+            blocks[0] += seq_len % batch_size
+            seqs = [
+                self.create_dummy_seq_group_metadata(
+                    i,
+                    b * self.block_size - 1,
+                    is_prompt,
+                    lora_request=dummy_lora_requests_per_seq[i]
+                    if dummy_lora_requests_per_seq else None,
+                    temperature=temperature) for i, b in enumerate(blocks)
             ]
-            seqs = []
-            last_block_assigned = 0
-            for i, b in enumerate(blocks):
-                seqs += [
-                    self.create_dummy_seq_group_metadata(
-                        i,
-                        b * self.block_size,
-                        is_prompt,
-                        lora_request=dummy_lora_requests_per_seq[i]
-                        if dummy_lora_requests_per_seq else None,
-                        temperature=temperature,
-                        last_block_assigned=last_block_assigned,
-                    )
-                ]
-                if len(seqs[-1].block_tables[i]) > 0:
-                    last_block_assigned = seqs[-1].block_tables[i][-1]
         torch.hpu.synchronize()
         profiler = None
         if is_pt_profiler_run and self.is_driver_worker:
