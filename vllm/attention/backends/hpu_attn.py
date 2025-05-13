@@ -540,9 +540,9 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                         self.head_size)
 
             attn_bias = attn_metadata.attn_bias
+            position_bias = None
             if attn_metadata is None or attn_metadata.block_list is None:
                 # If we have alibi_slopes, incorporate them with
-                position_bias = None
                 if (self.prompt_position_bias is not None
                         and self.alibi_slopes is not None):
                     assert attn_bias is not None, \
